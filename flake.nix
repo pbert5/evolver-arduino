@@ -103,6 +103,64 @@
               echo "==> Upload complete to $PORT."
             '';
           };
+
+          setup-arduino-nano = pkgs.writeShellApplication {
+            name = "setup-arduino-nano";
+            runtimeInputs = [ pkgs.arduino-cli ];
+            text = ''
+              set -euo pipefail
+              echo "==> Configuring arduino-cli for Arduino Nano (AVR)..."
+              arduino-cli config init --overwrite 2>/dev/null || true
+              arduino-cli core update-index
+              arduino-cli core install arduino:avr
+              echo "==> Installing required libraries..."
+              arduino-cli lib install "PID"
+              echo "==> Setup complete. (evolver_si is bundled in libraries/)"
+            '';
+          };
+
+          build-firmware-nano = pkgs.writeShellApplication {
+            name = "build-firmware-nano";
+            runtimeInputs = [ pkgs.arduino-cli ];
+            text = ''
+              set -euo pipefail
+              SKETCH="''${SKETCH:-Nano/MINEVOLVER}"
+              FQBN="''${FQBN:-arduino:avr:nano:cpu=atmega328old}"
+              OUT="''${PWD}/build/MINEVOLVER-Nano"
+              echo "==> Compiling $SKETCH for $FQBN ..."
+              mkdir -p "$OUT"
+              arduino-cli compile \
+                --fqbn "$FQBN" \
+                --output-dir "$OUT" \
+                --libraries "''${PWD}/libraries" \
+                "$SKETCH"
+              echo "==> Build artifacts: $OUT/"
+            '';
+          };
+
+          upload-firmware-nano = pkgs.writeShellApplication {
+            name = "upload-firmware-nano";
+            runtimeInputs = [ pkgs.arduino-cli ];
+            text = ''
+              set -euo pipefail
+              PORT="''${PORT:-/dev/ttyUSB0}"
+              FQBN="''${FQBN:-arduino:avr:nano:cpu=atmega328old}"
+              SKETCH="''${SKETCH:-Nano/MINEVOLVER}"
+
+              echo "WARNING: This will flash firmware to $PORT (Arduino Nano)."
+              echo "Do NOT run against a device in an active experiment."
+              printf "Continue? [y/N] "
+              read -r confirm
+              case "$confirm" in [yY]*) ;; *) echo "Aborted."; exit 1 ;; esac
+
+              OUT="''${PWD}/build/MINEVOLVER-Nano"
+              arduino-cli upload \
+                --port "$PORT" \
+                --fqbn "$FQBN" \
+                --input-dir "$OUT"
+              echo "==> Upload complete to $PORT."
+            '';
+          };
         in
         {
           "setup-arduino" = {
@@ -116,6 +174,18 @@
           "upload-firmware" = {
             type = "app";
             program = "${upload-firmware}/bin/upload-firmware";
+          };
+          "setup-arduino-nano" = {
+            type = "app";
+            program = "${setup-arduino-nano}/bin/setup-arduino-nano";
+          };
+          "build-firmware-nano" = {
+            type = "app";
+            program = "${build-firmware-nano}/bin/build-firmware-nano";
+          };
+          "upload-firmware-nano" = {
+            type = "app";
+            program = "${upload-firmware-nano}/bin/upload-firmware-nano";
           };
           default = {
             type = "app";
