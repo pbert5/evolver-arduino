@@ -1,10 +1,12 @@
 #include <evolver_si.h>
 #include <PID_v1.h>
 #include <SAMD21turboPWM.h>
+#include "identity.h"
 
 // String Input
 String input_string = "";
 boolean string_complete = false;
+uint32_t mev_seq = 0;
 
 int num_vials = 2;
 int active_vial = 0;
@@ -184,6 +186,28 @@ void loop() {
   readPD();
   serialEvent();
   if (string_complete) {
+    // Provisioning commands are checked before evolver_si parsing so they
+    // never collide with sensor addresses.
+    if (input_string.startsWith("WHO_ARE_YOU")) {
+      mev_send_hello(&SerialUSB, ++mev_seq);
+      string_complete = false;
+      input_string = "";
+      return;
+    }
+    if (input_string.startsWith("PROVISION,")) {
+      provisioningLogic();
+      string_complete = false;
+      input_string = "";
+      return;
+    }
+    if (input_string.startsWith("CLEAR_ID")) {
+      mev_clear_identity();
+      mev_send_clear_ack(&SerialUSB, ++mev_seq);
+      string_complete = false;
+      input_string = "";
+      return;
+    }
+
     pd.analyzeAndCheck(input_string);
     led.analyzeAndCheck(input_string);
     stir.analyzeAndCheck(input_string);
@@ -442,5 +466,45 @@ void pumpLogic() {
     }
     pump_new_input = false;
   }
-  pump.addressFound = false;  
+  pump.addressFound = false;
+}
+
+// Handle PROVISION,<device_id>,<owner_id>_! command.
+// Refuses silently if already provisioned — requires CLEAR_ID first.
+void provisioningLogic() {
+  // Strip trailing _! and everything after the payload
+  String cmd = input_string;
+  cmd.replace("_!", "");
+  cmd.trim();
+  // Expected: "PROVISION,<device_id>,<owner_id>"
+  int firstComma  = cmd.indexOf(',');
+  int secondComma = cmd.indexOf(',', firstComma + 1);
+  if (firstComma < 0 || secondComma < 0) {
+    mev_send_provision_err(&SerialUSB, ++mev_seq, "BLANK", "bad_format");
+    return;
+  }
+  String device_id_s = cmd.substring(firstComma + 1, secondComma);
+  String owner_id_s  = cmd.substring(secondComma + 1);
+  device_id_s.trim();
+  owner_id_s.trim();
+
+  if (device_id_s.length() == 0 || owner_id_s.length() == 0 ||
+      device_id_s.length() > 31 || owner_id_s.length() > 31) {
+    mev_send_provision_err(&SerialUSB, ++mev_seq, "BLANK", "bad_id_length");
+    return;
+  }
+
+  DeviceIdentity existing;
+  mev_load_identity(&existing);
+  if (mev_identity_valid(&existing)) {
+    // Already provisioned — require explicit CLEAR_ID before re-provisioning
+    mev_send_provision_err(&SerialUSB, ++mev_seq, existing.device_id, "already_provisioned");
+    return;
+  }
+
+  char dev_buf[32], owner_buf[32];
+  device_id_s.toCharArray(dev_buf, sizeof(dev_buf));
+  owner_id_s.toCharArray(owner_buf, sizeof(owner_buf));
+  mev_save_identity(dev_buf, owner_buf);
+  mev_send_provision_ack(&SerialUSB, ++mev_seq, dev_buf, owner_buf);
 }
