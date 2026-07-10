@@ -11,6 +11,13 @@
         "aarch64-linux"
       ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
+      mkApp =
+        program: description:
+        {
+          type = "app";
+          inherit program;
+          meta.description = description;
+        };
     in
     {
       devShells = forAllSystems (
@@ -163,34 +170,15 @@
           };
         in
         {
-          "setup-arduino" = {
-            type = "app";
-            program = "${setup-arduino}/bin/setup-arduino";
-          };
-          "build-firmware" = {
-            type = "app";
-            program = "${build-firmware}/bin/build-firmware";
-          };
-          "upload-firmware" = {
-            type = "app";
-            program = "${upload-firmware}/bin/upload-firmware";
-          };
-          "setup-arduino-nano" = {
-            type = "app";
-            program = "${setup-arduino-nano}/bin/setup-arduino-nano";
-          };
-          "build-firmware-nano" = {
-            type = "app";
-            program = "${build-firmware-nano}/bin/build-firmware-nano";
-          };
-          "upload-firmware-nano" = {
-            type = "app";
-            program = "${upload-firmware-nano}/bin/upload-firmware-nano";
-          };
-          default = {
-            type = "app";
-            program = "${build-firmware}/bin/build-firmware";
-          };
+          "setup-arduino" = mkApp "${setup-arduino}/bin/setup-arduino" "Set up Arduino tooling for SAMD21 firmware.";
+          "build-firmware" = mkApp "${build-firmware}/bin/build-firmware" "Build SAMD21 eVOLVER firmware.";
+          "upload-firmware" = mkApp "${upload-firmware}/bin/upload-firmware" "Upload SAMD21 eVOLVER firmware.";
+          "setup-arduino-nano" = mkApp "${setup-arduino-nano}/bin/setup-arduino-nano" "Set up Arduino Nano tooling.";
+          "build-firmware-nano" =
+            mkApp "${build-firmware-nano}/bin/build-firmware-nano" "Build Arduino Nano eVOLVER firmware.";
+          "upload-firmware-nano" =
+            mkApp "${upload-firmware-nano}/bin/upload-firmware-nano" "Upload Arduino Nano eVOLVER firmware.";
+          default = mkApp "${build-firmware}/bin/build-firmware" "Build SAMD21 eVOLVER firmware.";
         }
       );
 
