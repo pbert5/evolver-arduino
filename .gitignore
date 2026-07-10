@@ -4,3 +4,5 @@ Icon*
 *.o
 *.elf
 /build/*
+__pycache__/
+*.pyc
