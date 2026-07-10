@@ -3,3 +3,4 @@ Icon*
 *.hex
 *.o
 *.elf
+/build/*
