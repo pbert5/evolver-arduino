@@ -62,7 +62,7 @@
               arduino-cli config set board_manager.additional_urls \
                 https://raw.githubusercontent.com/sparkfun/Arduino_Boards/main/IDE_Board_Manager/package_sparkfun_index.json
               arduino-cli core update-index
-              arduino-cli core install sparkfun:samd
+              arduino-cli core install sparkfun:samd arduino:samd
               echo "==> Installing required libraries..."
               arduino-cli lib install "FlashStorage_SAMD" "PID" "SimpleTimer"
               echo "==> Setup complete."
@@ -75,11 +75,11 @@
             text = ''
               set -euo pipefail
               SKETCH="''${SKETCH:-SAMD21/MINEVOLVER}"
-              FQBN="''${FQBN:-sparkfun:samd:sparkfun_samd21_mini}"
+              FQBN="''${FQBN:-SparkFun:samd:samd21_mini}"
               OUT="''${PWD}/build/MINEVOLVER"
               echo "==> Compiling $SKETCH for $FQBN ..."
               mkdir -p "$OUT"
-              arduino-cli compile --fqbn "$FQBN" --output-dir "$OUT" "$SKETCH"
+              arduino-cli compile --fqbn "$FQBN" --output-dir "$OUT" --libraries "''${PWD}/libraries" "$SKETCH"
               echo "==> Build artifacts: $OUT/"
             '';
           };
@@ -92,7 +92,7 @@
             text = ''
               set -euo pipefail
               PORT="''${PORT:-}"
-              FQBN="''${FQBN:-sparkfun:samd:sparkfun_samd21_mini}"
+              FQBN="''${FQBN:-SparkFun:samd:samd21_mini}"
               SKETCH="''${SKETCH:-SAMD21/MINEVOLVER}"
 
               if [ -z "$PORT" ]; then

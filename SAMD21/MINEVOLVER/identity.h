@@ -35,10 +35,11 @@ struct DeviceIdentity {
 FlashStorage(mev_flash, DeviceIdentity);
 
 static void _mev_flash_read(DeviceIdentity *out) {
-  *out = mev_flash.read();
+  mev_flash.read(*out);
 }
 static void _mev_flash_write(const DeviceIdentity *id) {
-  mev_flash.write(*id);
+  DeviceIdentity tmp = *id;
+  mev_flash.write(tmp);
 }
 
 #else
