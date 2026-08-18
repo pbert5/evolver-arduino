@@ -14,7 +14,8 @@
 #define MEV_MAGIC         0x4D455601u  /* 'M','E','V', struct_ver=1 */
 #define MEV_PROTO_VER     2
 #define MEV_FW_VER_MAJOR  0
-#define MEV_FW_VER_MINOR  1
+#define MEV_FW_VER_MINOR  2
+#define MEV_HW_PROTO_VER  1
 #define MEV_DEVICE_TYPE   "minievolver"
 #define MEV_FRAME_MAX     200
 
@@ -109,11 +110,11 @@ static void mev_send_hello(Stream *serial, uint32_t seq) {
   const char *dev_id = (mev_identity_valid(&id) && id.device_id[0]) ? id.device_id : "BLANK";
   const char *owner  = (mev_identity_valid(&id) && id.owner_id[0])  ? id.owner_id  : "BLANK";
 
-  char payload[96];
+  char payload[128];
   snprintf(payload, sizeof(payload),
-    "type=%s,proto=%d,fw=%d.%d,id=%s,owner=%s",
+    "type=%s,proto=%d,fw=%d.%d,hw_proto=%d,id=%s,owner=%s",
     MEV_DEVICE_TYPE, MEV_PROTO_VER, MEV_FW_VER_MAJOR, MEV_FW_VER_MINOR,
-    dev_id, owner);
+    MEV_HW_PROTO_VER, dev_id, owner);
 
   uint8_t crc = mev_crc8(payload, sizeof(payload));
   char frame[MEV_FRAME_MAX];

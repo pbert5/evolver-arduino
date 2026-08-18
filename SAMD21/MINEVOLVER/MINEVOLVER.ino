@@ -71,6 +71,28 @@ boolean pump_new_input = false;
 int pumpOutputPin[] = {6, 7, 8, 9, 10, 12};
 byte ipp = 0;
 
+// Commissioning/debug protocol.  It is deliberately separate from evolver_si
+// commands: only complete HW_*_! messages reach this code.
+const unsigned long HW_IDLE_TIMEOUT_MS = 15000;
+const unsigned long HW_MAX_PUMP_MS = 1000;
+const unsigned long HW_MAX_STIR_MS = 1000;
+const unsigned long HW_MAX_HEATER_MS = 250;
+const int HW_MAX_LED_LEVEL = 255;
+const int HW_MAX_STIR_LEVEL = 250;
+const int HW_MAX_HEATER_LEVEL = 64;
+bool hardwareTestMode = false;
+bool normalControllerSuspended = false;
+unsigned long hardwareLastCommand = 0;
+
+struct HardwarePulse {
+  bool active;
+  int channel;
+  unsigned long endsAt;
+};
+HardwarePulse pumpPulse = {false, -1, 0};
+HardwarePulse stirPulse = {false, -1, 0};
+HardwarePulse heaterPulse = {false, -1, 0};
+
 class Pump {
   boolean pumpRunning = false;
   int addr; int timeToPump = 0;
@@ -139,6 +161,8 @@ class Pump {
       }
       timeToPump = 0;
       pumpInterval = 0;
+      pumpRunning = false;
+      previousMillis = millis();
     }
 
     bool isNewChemostat(float newTimeToPump, int newPumpInterval) {
@@ -167,6 +191,10 @@ void setup() {
   pwm.analogWrite(11, 100);
   pwm.analogWrite(13, 100);
   pinMode(12, OUTPUT);
+  for (int i = 0; i < num_vials; i++) {
+    pinMode(tempOutputPin[i], OUTPUT);
+    pinMode(4 + i, OUTPUT);
+  }
 
   for (int i = 0; i < numPumps; i++) {    
     pumps[i].init(i);
@@ -182,7 +210,7 @@ void setup() {
 }
 
 void loop() {
-  readTemp();
+  if (!hardwareTestMode) readTemp();
   readPD();
   serialEvent();
   if (string_complete) {
@@ -207,6 +235,16 @@ void loop() {
       input_string = "";
       return;
     }
+    if (input_string.startsWith("HW_")) {
+      hardwareCommandLogic();
+      string_complete = false;
+      input_string = "";
+      return;
+    }
+
+    // A normal experiment command explicitly returns control to the normal
+    // controller.  It never resumes a pending commissioning pulse.
+    if (hardwareTestMode || normalControllerSuspended) exitHardwareTestMode();
 
     pd.analyzeAndCheck(input_string);
     led.analyzeAndCheck(input_string);
@@ -242,12 +280,137 @@ void loop() {
   string_complete = false;
   input_string = "";
   for (int i = 0; i < numPumps; i++) {
-    pumps[i].update();
+    if (!hardwareTestMode) pumps[i].update();
+  }
+  updateHardwarePulses();
+  if (hardwareTestMode && millis() - hardwareLastCommand > HW_IDLE_TIMEOUT_MS) {
+    setHardwareSafeState();
+    hardwareTestMode = false;
   }
 
   if (input_string.length() > 20000) {
     input_string = "";  
   }
+}
+
+void hwReply(const char *status, const char *operation, String fields) {
+  SerialUSB.print("HW|");
+  SerialUSB.print(MEV_HW_PROTO_VER);
+  SerialUSB.print("|");
+  SerialUSB.print(status);
+  SerialUSB.print("|");
+  SerialUSB.print(operation);
+  if (fields.length()) { SerialUSB.print("|"); SerialUSB.print(fields); }
+  SerialUSB.println();
+}
+
+bool hwChannel(const String &value, int count, int *channel) {
+  if (!value.length()) return false;
+  for (unsigned int i = 0; i < value.length(); i++) if (!isDigit(value[i])) return false;
+  *channel = value.toInt();
+  return *channel >= 0 && *channel < count;
+}
+
+bool hwRange(const String &value, int maximum, int *number) {
+  if (!value.length()) return false;
+  for (unsigned int i = 0; i < value.length(); i++) if (!isDigit(value[i])) return false;
+  *number = value.toInt();
+  return *number >= 0 && *number <= maximum;
+}
+
+void pumpWrite(int channel, bool on) {
+  if (pumpOutputPin[channel] == 12) digitalWrite(12, on ? HIGH : LOW);
+  else analogWrite(pumpOutputPin[channel], on ? 255 : 0);
+}
+
+// This is the sole shutdown path for commissioning outputs.  It also cancels
+// normal pump schedules, so an old chemostat interval cannot restart a pump.
+void setHardwareSafeState() {
+  normalControllerSuspended = true;
+  pumpPulse.active = stirPulse.active = heaterPulse.active = false;
+  for (int i = 0; i < numPumps; i++) pumps[i].turnOff();
+  for (int i = 0; i < num_vials; i++) {
+    pwm.analogWrite(stirOutputPin[i], 0);
+    analogWrite(tempOutputPin[i], 255); // heater drivers are active-low
+    analogWrite(4 + i, 0);
+    tempOutput[i] = 0;
+    allTempPIDS[i]->SetMode(MANUAL);
+  }
+}
+
+void enterHardwareTestMode() {
+  if (!hardwareTestMode) setHardwareSafeState();
+  hardwareTestMode = true;
+  hardwareLastCommand = millis();
+}
+
+void exitHardwareTestMode() {
+  setHardwareSafeState();
+  hardwareTestMode = false;
+  normalControllerSuspended = false;
+  for (int i = 0; i < num_vials; i++) allTempPIDS[i]->SetMode(AUTOMATIC);
+}
+
+void updateHardwarePulses() {
+  unsigned long now = millis();
+  if (pumpPulse.active && (long)(now - pumpPulse.endsAt) >= 0) {
+    pumpWrite(pumpPulse.channel, false); pumpPulse.active = false;
+  }
+  if (stirPulse.active && (long)(now - stirPulse.endsAt) >= 0) {
+    pwm.analogWrite(stirOutputPin[stirPulse.channel], 0); stirPulse.active = false;
+  }
+  if (heaterPulse.active && (long)(now - heaterPulse.endsAt) >= 0) {
+    analogWrite(tempOutputPin[heaterPulse.channel], 255); heaterPulse.active = false;
+  }
+}
+
+void hardwareCommandLogic() {
+  String cmd = input_string;
+  cmd.replace("\r", ""); cmd.replace("\n", ""); cmd.trim();
+  if (!cmd.endsWith("_!")) { hwReply("ERR", "UNKNOWN", "reason=bad_terminator"); return; }
+  cmd.remove(cmd.length() - 2);
+  int commas[4] = {-1, -1, -1, -1}; int found = 0;
+  for (unsigned int i = 0; i < cmd.length() && found < 4; i++) if (cmd[i] == ',') commas[found++] = i;
+  String operation = found ? cmd.substring(0, commas[0]) : cmd;
+  String arg1 = found > 0 ? cmd.substring(commas[0] + 1, found > 1 ? commas[1] : cmd.length()) : "";
+  String arg2 = found > 1 ? cmd.substring(commas[1] + 1, found > 2 ? commas[2] : cmd.length()) : "";
+  String arg3 = found > 2 ? cmd.substring(commas[2] + 1) : "";
+  int channel, duration, level;
+
+  if (operation == "HW_STATUS" && found == 0) {
+    DeviceIdentity id; mev_load_identity(&id);
+    String dev = (mev_identity_valid(&id) && id.device_id[0]) ? id.device_id : "BLANK";
+    hwReply("OK", "STATUS", "sleeves=2,pumps=6,fw=" + String(MEV_FW_VER_MAJOR) + "." + String(MEV_FW_VER_MINOR) + ",id=" + dev + ",hw_proto=1");
+    return;
+  }
+  if ((operation == "HW_SAFE" || operation == "HW_ALL_OFF") && found == 0) {
+    setHardwareSafeState(); hardwareTestMode = false;
+    hwReply("OK", "SAFE", "outputs=off"); return;
+  }
+  if (operation == "HW_READ_THERMISTOR" && found == 1 && hwChannel(arg1, num_vials, &channel)) {
+    enterHardwareTestMode(); hwReply("OK", "THERMISTOR", "channel=" + String(channel) + ",value=" + String(analogRead(temp_pin[channel]))); return;
+  }
+  if (operation == "HW_READ_PHOTODIODE" && found == 1 && hwChannel(arg1, num_vials, &channel)) {
+    enterHardwareTestMode(); hwReply("OK", "PHOTODIODE", "channel=" + String(channel) + ",value=" + String(analogRead(pd_pin[channel]))); return;
+  }
+  if (operation == "HW_SET_OD_LED" && found == 2 && hwChannel(arg1, num_vials, &channel) && hwRange(arg2, HW_MAX_LED_LEVEL, &level)) {
+    enterHardwareTestMode(); analogWrite(4 + channel, level);
+    hwReply("OK", "SET_OD_LED", "channel=" + String(channel) + ",pin=" + String(4 + channel) + ",level=" + String(level)); return;
+  }
+  if (operation == "HW_PULSE_PUMP" && found == 2 && hwChannel(arg1, numPumps, &channel) && hwRange(arg2, HW_MAX_PUMP_MS, &duration) && duration > 0) {
+    enterHardwareTestMode(); pumpWrite(channel, true); pumpPulse = {true, channel, millis() + (unsigned long)duration};
+    hwReply("OK", "PULSE_PUMP", "channel=" + String(channel) + ",pin=" + String(pumpOutputPin[channel]) + ",duration_ms=" + String(duration)); return;
+  }
+  if (operation == "HW_PULSE_STIR" && found == 3 && hwChannel(arg1, num_vials, &channel) && hwRange(arg2, HW_MAX_STIR_MS, &duration) && duration > 0 && hwRange(arg3, HW_MAX_STIR_LEVEL, &level) && level > 0) {
+    enterHardwareTestMode(); pwm.analogWrite(stirOutputPin[channel], level); stirPulse = {true, channel, millis() + (unsigned long)duration};
+    hwReply("OK", "PULSE_STIR", "channel=" + String(channel) + ",pin=" + String(stirOutputPin[channel]) + ",duration_ms=" + String(duration) + ",level=" + String(level)); return;
+  }
+  if (operation == "HW_PULSE_HEATER" && found == 3 && hwChannel(arg1, num_vials, &channel) && hwRange(arg2, HW_MAX_HEATER_MS, &duration) && duration > 0 && hwRange(arg3, HW_MAX_HEATER_LEVEL, &level) && level > 0) {
+    enterHardwareTestMode(); analogWrite(tempOutputPin[channel], 255 - level); heaterPulse = {true, channel, millis() + (unsigned long)duration};
+    hwReply("OK", "PULSE_HEATER", "channel=" + String(channel) + ",pin=" + String(tempOutputPin[channel]) + ",duration_ms=" + String(duration) + ",level=" + String(level)); return;
+  }
+  String responseOperation = operation; responseOperation.replace("HW_", "");
+  hwReply("ERR", responseOperation.c_str(), "reason=invalid_command_or_arguments");
 }
 
 void serialEvent() {
