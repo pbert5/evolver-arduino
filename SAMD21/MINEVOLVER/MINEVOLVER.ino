@@ -188,24 +188,29 @@ void setup() {
   // Set up TurboPWM for stir
   pwm.setClockDivider(255, false);
   pwm.timer(2,256, 35000, true);
-  pwm.analogWrite(11, 100);
-  pwm.analogWrite(13, 100);
+  pwm.analogWrite(11, 0);
+  pwm.analogWrite(13, 0);
   pinMode(12, OUTPUT);
+  digitalWrite(12, LOW);
   for (int i = 0; i < num_vials; i++) {
     pinMode(tempOutputPin[i], OUTPUT);
     pinMode(4 + i, OUTPUT);
+    analogWrite(tempOutputPin[i], 255); // heater drivers are active-low
+    analogWrite(4 + i, 0);
+    tempOutput[i] = 0;
+    allTempPIDS[i]->SetOutputLimits(0,255);
+    allTempPIDS[i]->SetMode(MANUAL);
   }
 
   for (int i = 0; i < numPumps; i++) {    
     pumps[i].init(i);
   }
 
+  // Do not enable temperature control until an explicit normal controller
+  // command arrives.  This keeps all outputs safe while USB is disconnected,
+  // during bootloader transitions, and after a fresh flash.
+  normalControllerSuspended = true;
   while(!SerialUSB);
-
-  for (int i = 0; i < num_vials; i++) {
-    allTempPIDS[i]->SetOutputLimits(0,255);
-    allTempPIDS[i]->SetMode(AUTOMATIC);
-  }
     
 }
 
