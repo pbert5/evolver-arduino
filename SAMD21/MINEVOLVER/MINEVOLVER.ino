@@ -27,20 +27,21 @@ evolver_si pd("od_90", "_!", expectedPDinputs);
 boolean new_PDinput = false;
 int saved_PD_averaged = 1000;
 
-//LED Settings
+// LED Settings
 String led_address = "od_led";
 evolver_si led("od_led", "_!", num_vials + 1);
 boolean new_LEDinput = false;
-int saved_LEDinputs[] = {255, 255};
+int saved_LEDinputs[] = {0, 0};
 
 // TEMP
-double tempSetpoint[] = {60000, 60000};
+double tempSetpoint[] = {0, 0};
 double tempOutput[2], tempInput[2];
 int tempOutputPin[] = {2, 3};
 String temp_address = "temp";
 boolean temp_new_input = false;
 evolver_si temp("temp", "_!", num_vials + 1);
-int temp_saved_inputs[] = {255, 255};
+int temp_saved_inputs[] = {0, 0};
+bool temperatureControlEnabled[] = {false, false};
 
 int Kp = 6500;
 int Ki = 20;
@@ -104,12 +105,7 @@ class Pump {
     Pump() {}
     void init(int addrInit) {
       addr = addrInit;
-      if (pumpOutputPin[addr] != 12) {
-        analogWrite(pumpOutputPin[addr], speedset[0]);
-      }
-      else {
-        digitalWrite(12, LOW);  
-      }
+      turnOff();
     }
 
     void update() {  
@@ -179,43 +175,61 @@ class Pump {
 
 Pump pumps[numPumps];
 
-void setup() {
-  analogReadResolution(16);
-  SerialUSB.begin(9600);
-  // reserve 1000 bytes for the input_string
-  input_string.reserve(1000);
-
-  // Set up TurboPWM for stir
-  pwm.setClockDivider(255, false);
-  pwm.timer(2,256, 35000, true);
-  pwm.analogWrite(11, 0);
-  pwm.analogWrite(13, 0);
-  pinMode(12, OUTPUT);
-  digitalWrite(12, LOW);
+// Setup-only safe initialization. It intentionally avoids runtime PID and Pump
+// methods, so it remains safe before their state has been initialized.
+void initializeHardwareSafeState() {
+  hardwareTestMode = false;
+  normalControllerSuspended = true;
+  pumpPulse.active = stirPulse.active = heaterPulse.active = false;
+  for (int i = 0; i < numPumps; i++) {
+    pinMode(pumpOutputPin[i], OUTPUT);
+    if (pumpOutputPin[i] == 12) digitalWrite(12, LOW);
+    else analogWrite(pumpOutputPin[i], 0);
+    pumpSavedInputs[i] = "--";
+  }
   for (int i = 0; i < num_vials; i++) {
     pinMode(tempOutputPin[i], OUTPUT);
     pinMode(4 + i, OUTPUT);
     analogWrite(tempOutputPin[i], 255); // heater drivers are active-low
     analogWrite(4 + i, 0);
+    pwm.analogWrite(stirOutputPin[i], 0);
+    tempSetpoint[i] = 0;
+    temp_saved_inputs[i] = 0;
     tempOutput[i] = 0;
+    saved_LEDinputs[i] = 0;
+    stir_saved_inputs[i] = 0;
+    temperatureControlEnabled[i] = false;
+  }
+}
+
+void setup() {
+  analogReadResolution(16);
+  // Configure PWM before writing its physical outputs, then force every
+  // actuator OFF before any serial wait or normal control path can run.
+  pwm.setClockDivider(255, false);
+  pwm.timer(2,256, 35000, true);
+  initializeHardwareSafeState();
+
+  for (int i = 0; i < numPumps; i++) {
+    pumps[i].init(i);
+  }
+  for (int i = 0; i < num_vials; i++) {
     allTempPIDS[i]->SetOutputLimits(0,255);
     allTempPIDS[i]->SetMode(MANUAL);
   }
 
-  for (int i = 0; i < numPumps; i++) {    
-    pumps[i].init(i);
-  }
-
-  // Do not enable temperature control until an explicit normal controller
-  // command arrives.  This keeps all outputs safe while USB is disconnected,
-  // during bootloader transitions, and after a fresh flash.
-  normalControllerSuspended = true;
+  SerialUSB.begin(9600);
+  input_string.reserve(1000);
+  // The board may wait indefinitely for USB, but all outputs are already safe.
   while(!SerialUSB);
     
 }
 
 void loop() {
-  if (!hardwareTestMode) readTemp();
+  if (!hardwareTestMode) {
+    readTempSensors();
+    updateTemperatureControl();
+  }
   readPD();
   serialEvent();
   if (string_complete) {
@@ -339,6 +353,7 @@ void setHardwareSafeState() {
     analogWrite(tempOutputPin[i], 255); // heater drivers are active-low
     analogWrite(4 + i, 0);
     tempOutput[i] = 0;
+    temperatureControlEnabled[i] = false;
     allTempPIDS[i]->SetMode(MANUAL);
   }
 }
@@ -353,7 +368,6 @@ void exitHardwareTestMode() {
   setHardwareSafeState();
   hardwareTestMode = false;
   normalControllerSuspended = false;
-  for (int i = 0; i < num_vials; i++) allTempPIDS[i]->SetMode(AUTOMATIC);
 }
 
 void updateHardwarePulses() {
@@ -385,7 +399,10 @@ void hardwareCommandLogic() {
   if (operation == "HW_STATUS" && found == 0) {
     DeviceIdentity id; mev_load_identity(&id);
     String dev = (mev_identity_valid(&id) && id.device_id[0]) ? id.device_id : "BLANK";
-    hwReply("OK", "STATUS", "sleeves=2,pumps=6,fw=" + String(MEV_FW_VER_MAJOR) + "." + String(MEV_FW_VER_MINOR) + ",id=" + dev + ",hw_proto=1");
+    bool temperatureControlActive = false;
+    for (int i = 0; i < num_vials; i++) temperatureControlActive = temperatureControlActive || temperatureControlEnabled[i];
+    String mode = hardwareTestMode ? "hardware_test" : (normalControllerSuspended ? "idle" : "normal");
+    hwReply("OK", "STATUS", "sleeves=2,pumps=6,fw=" + String(MEV_FW_VER_MAJOR) + "." + String(MEV_FW_VER_MINOR) + ",id=" + dev + ",hw_proto=1,temp_control=" + (temperatureControlActive ? "on" : "off") + ",mode=" + mode);
     return;
   }
   if ((operation == "HW_SAFE" || operation == "HW_ALL_OFF") && found == 0) {
@@ -467,7 +484,7 @@ void readPD() {
   }
 }
 
-void readTemp() {
+void readTempSensors() {
   unsigned long total[num_vials];
   int readings[num_vials];
   int times_avg = 3;
@@ -484,7 +501,15 @@ void readTemp() {
     tempInput[i] = readings[i];    
   }
 
+}
+
+void updateTemperatureControl() {
   for (int i = 0; i < num_vials; i++) {
+    if (!temperatureControlEnabled[i]) {
+      tempOutput[i] = 0;
+      analogWrite(tempOutputPin[i], 255); // heater drivers are active-low
+      continue;
+    }
     allTempPIDS[i]->Compute();
     int set_value = tempOutput[i];
     analogWrite(tempOutputPin[i], (255 - set_value));
@@ -553,7 +578,15 @@ void tempLogic() {
   }
   if (temp.input_array[0] == "a" && temp_new_input) {
     for (int i = 0; i < num_vials; i++) {
-      tempSetpoint[i] = (double)temp_saved_inputs[i];        
+      tempSetpoint[i] = (double)temp_saved_inputs[i];
+      tempOutput[i] = 0;
+      temperatureControlEnabled[i] = temp_saved_inputs[i] > 0;
+      allTempPIDS[i]->SetMode(
+        temperatureControlEnabled[i] ? AUTOMATIC : MANUAL
+      );
+      if (!temperatureControlEnabled[i]) {
+        analogWrite(tempOutputPin[i], 255); // heater drivers are active-low
+      }
     }
     temp_new_input = false;
   }
