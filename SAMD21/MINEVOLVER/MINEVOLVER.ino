@@ -188,9 +188,12 @@ void initializeHardwareSafeState() {
     pumpSavedInputs[i] = "--";
   }
   for (int i = 0; i < num_vials; i++) {
+    // Set the output latch low before enabling the N-MOSFET gate pin, then
+    // explicitly drive zero-duty PWM.  LOW is the heater-safe state.
+    digitalWrite(tempOutputPin[i], LOW);
     pinMode(tempOutputPin[i], OUTPUT);
     pinMode(4 + i, OUTPUT);
-    analogWrite(tempOutputPin[i], 255); // heater drivers are active-low
+    analogWrite(tempOutputPin[i], 0);
     analogWrite(4 + i, 0);
     pwm.analogWrite(stirOutputPin[i], 0);
     tempSetpoint[i] = 0;
@@ -350,7 +353,7 @@ void setHardwareSafeState() {
   for (int i = 0; i < numPumps; i++) pumps[i].turnOff();
   for (int i = 0; i < num_vials; i++) {
     pwm.analogWrite(stirOutputPin[i], 0);
-    analogWrite(tempOutputPin[i], 255); // heater drivers are active-low
+    analogWrite(tempOutputPin[i], 0);
     analogWrite(4 + i, 0);
     tempOutput[i] = 0;
     temperatureControlEnabled[i] = false;
@@ -379,7 +382,7 @@ void updateHardwarePulses() {
     pwm.analogWrite(stirOutputPin[stirPulse.channel], 0); stirPulse.active = false;
   }
   if (heaterPulse.active && (long)(now - heaterPulse.endsAt) >= 0) {
-    analogWrite(tempOutputPin[heaterPulse.channel], 255); heaterPulse.active = false;
+    analogWrite(tempOutputPin[heaterPulse.channel], 0); heaterPulse.active = false;
   }
 }
 
@@ -428,7 +431,7 @@ void hardwareCommandLogic() {
     hwReply("OK", "PULSE_STIR", "channel=" + String(channel) + ",pin=" + String(stirOutputPin[channel]) + ",duration_ms=" + String(duration) + ",level=" + String(level)); return;
   }
   if (operation == "HW_PULSE_HEATER" && found == 3 && hwChannel(arg1, num_vials, &channel) && hwRange(arg2, HW_MAX_HEATER_MS, &duration) && duration > 0 && hwRange(arg3, HW_MAX_HEATER_LEVEL, &level) && level > 0) {
-    enterHardwareTestMode(); analogWrite(tempOutputPin[channel], 255 - level); heaterPulse = {true, channel, millis() + (unsigned long)duration};
+    enterHardwareTestMode(); analogWrite(tempOutputPin[channel], level); heaterPulse = {true, channel, millis() + (unsigned long)duration};
     hwReply("OK", "PULSE_HEATER", "channel=" + String(channel) + ",pin=" + String(tempOutputPin[channel]) + ",duration_ms=" + String(duration) + ",level=" + String(level)); return;
   }
   String responseOperation = operation; responseOperation.replace("HW_", "");
@@ -507,12 +510,12 @@ void updateTemperatureControl() {
   for (int i = 0; i < num_vials; i++) {
     if (!temperatureControlEnabled[i]) {
       tempOutput[i] = 0;
-      analogWrite(tempOutputPin[i], 255); // heater drivers are active-low
+      analogWrite(tempOutputPin[i], 0);
       continue;
     }
     allTempPIDS[i]->Compute();
     int set_value = tempOutput[i];
-    analogWrite(tempOutputPin[i], (255 - set_value));
+    analogWrite(tempOutputPin[i], set_value);
   }
 }
 
@@ -585,7 +588,7 @@ void tempLogic() {
         temperatureControlEnabled[i] ? AUTOMATIC : MANUAL
       );
       if (!temperatureControlEnabled[i]) {
-        analogWrite(tempOutputPin[i], 255); // heater drivers are active-low
+        analogWrite(tempOutputPin[i], 0);
       }
     }
     temp_new_input = false;

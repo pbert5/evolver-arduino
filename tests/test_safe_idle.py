@@ -25,7 +25,8 @@ def test_boot_forces_every_output_safe_before_usb_wait():
     safe = _function("initializeHardwareSafeState")
     assert "initializeHardwareSafeState();" in setup
     assert setup.index("initializeHardwareSafeState();") < setup.index("while(!SerialUSB)")
-    assert "analogWrite(tempOutputPin[i], 255)" in safe
+    assert "digitalWrite(tempOutputPin[i], LOW)" in safe
+    assert "analogWrite(tempOutputPin[i], 0)" in safe
     assert "analogWrite(4 + i, 0)" in safe
     assert "pwm.analogWrite(stirOutputPin[i], 0)" in safe
     assert "digitalWrite(12, LOW)" in safe
@@ -37,7 +38,7 @@ def test_boot_and_safe_state_leave_temperature_control_manual_and_off():
     safe = _function("setHardwareSafeState")
     assert "allTempPIDS[i]->SetMode(MANUAL);" in setup
     assert "temperatureControlEnabled[i] = false;" in safe
-    assert "analogWrite(tempOutputPin[i], 255)" in safe
+    assert "analogWrite(tempOutputPin[i], 0)" in safe
     assert "allTempPIDS[i]->SetMode(MANUAL);" in safe
 
 
@@ -49,7 +50,15 @@ def test_only_applied_normal_temp_target_enables_pid():
     assert "temperatureControlEnabled[i] ? AUTOMATIC : MANUAL" in temp_logic
     assert "SetMode(AUTOMATIC)" not in exit_test
     assert "if (!temperatureControlEnabled[i])" in update
-    assert "analogWrite(tempOutputPin[i], 255)" in update
+    assert "analogWrite(tempOutputPin[i], 0)" in update
+    assert "analogWrite(tempOutputPin[i], set_value)" in update
+
+
+def test_heater_pulse_uses_low_side_active_high_pwm_and_returns_off():
+    command = _function("hardwareCommandLogic")
+    pulses = _function("updateHardwarePulses")
+    assert "analogWrite(tempOutputPin[channel], level)" in command
+    assert "analogWrite(tempOutputPin[heaterPulse.channel], 0)" in pulses
 
 
 def test_status_reports_idle_temperature_control_state():
