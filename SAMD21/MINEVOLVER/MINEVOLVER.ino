@@ -223,8 +223,9 @@ void setup() {
 
   SerialUSB.begin(9600);
   input_string.reserve(1000);
-  // The board may wait indefinitely for USB, but all outputs are already safe.
-  while(!SerialUSB);
+  // Do not wait indefinitely for a USB host. The edge service opens the CDC
+  // device after boot and must be able to probe it without a DTR-dependent
+  // startup handshake. Outputs are already safe before serial setup.
     
 }
 

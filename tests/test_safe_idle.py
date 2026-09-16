@@ -20,11 +20,12 @@ def _function(name: str) -> str:
     raise AssertionError(f"unterminated function {name}")
 
 
-def test_boot_forces_every_output_safe_before_usb_wait():
+def test_boot_forces_every_output_safe_before_usb_setup():
     setup = _function("setup")
     safe = _function("initializeHardwareSafeState")
     assert "initializeHardwareSafeState();" in setup
-    assert setup.index("initializeHardwareSafeState();") < setup.index("while(!SerialUSB)")
+    assert "while(!SerialUSB)" not in setup
+    assert setup.index("initializeHardwareSafeState();") < setup.index("SerialUSB.begin(9600)")
     assert "digitalWrite(tempOutputPin[i], LOW)" in safe
     assert "analogWrite(tempOutputPin[i], 0)" in safe
     assert "analogWrite(4 + i, 0)" in safe
