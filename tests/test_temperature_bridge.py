@@ -49,23 +49,25 @@ def test_v2_temperature_protocol_is_dispatched_before_legacy_commands():
     assert loop.index("hardwareTemperatureCommandLogic();") < loop.index("pd.analyzeAndCheck")
 
 
-def test_hardware_service_temperature_frame_is_exactly_comma_delimited_v2():
+def test_legacy_hardware_temperature_frame_is_explicitly_disabled():
     command = _function("hardwareTemperatureCommandLogic")
-    assert 'cmd.substring(0, comma1) != "HW_TEMP_V2"' in command
-    assert 'cmd.endsWith("_!")' in command
-    assert "channelValue" in command
-    assert "rawValue" in command
-    assert "cmd.indexOf(',', comma2 + 1) >= 0" in command
-    assert 'hwReply("OK", "TEMP_V2"' in command
+    assert 'hwReply("ERR", "TEMP_V2", "reason=disabled_use_TEMP_PIPE_V2")' in command
+    assert "tempSetpoint[" not in command
+    assert "temperatureControlEnabled[" not in command
+    assert "SetMode(AUTOMATIC)" not in command
+    assert "temperatureLastCommand" not in command
 
 
-def test_hardware_service_temperature_frame_rejects_legacy_pipe_and_bad_raw_bounds():
+def test_secure_temperature_path_is_the_only_integrated_setpoint_mutation_path():
     command = _function("hardwareTemperatureCommandLogic")
-    assert 'raw < TEMP_RAW_SETPOINT_MIN' in command
-    assert 'raw > TEMP_RAW_SETPOINT_MAX' in command
-    assert "TEMP_RAW_SETPOINT_MIN = 1UL" in SOURCE
-    assert "TEMP_RAW_SETPOINT_MAX = 65535UL" in SOURCE
-    assert 'cmd.substring(0, comma1) != "HW_TEMP_V2"' in command
+    secure = _function("temperatureCommandLogic")
+    assert "tempSetpoint[channel] = (double)raw;" in secure
+    assert "tempOwnerMatches" in secure
+    assert "tempCorrelationSeen" in secure
+    assert "tempLeaseActive" in secure
+    assert "tempGeneration" in secure
+    assert "tempSetpoint[channel] =" not in command
+    assert "allTempPIDS[channel]" not in command
 
 
 def test_hardware_temperature_parser_serializer_round_trip_and_boundaries():

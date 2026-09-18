@@ -474,45 +474,11 @@ void hardwareCommandLogic() {
   hwReply("ERR", responseOperation.c_str(), "reason=invalid_command_or_arguments");
 }
 
-// Compatibility boundary for the hardware service's frozen v2 temperature
-// grammar: HW_TEMP_V2,<channel>,<raw>_!.  Ownership, lease, generation, and
-// correlation remain fenced by the service boundary; the legacy TEMP|2| path
-// below retains the firmware-native authority contract for direct callers.
+// The hardware service now emits the fenced TEMP|2 protocol.  Keep the old
+// HW_TEMP_V2 grammar fail-closed for upgrades, but never mutate temperature
+// state from it: TEMP|2 is the sole integrated temperature mutation path.
 void hardwareTemperatureCommandLogic() {
-  String cmd = input_string;
-  cmd.replace("\r", ""); cmd.replace("\n", ""); cmd.trim();
-  if (!cmd.endsWith("_!")) {
-    hwReply("ERR", "TEMP_V2", "reason=bad_terminator");
-    return;
-  }
-  cmd.remove(cmd.length() - 2);
-  int comma1 = cmd.indexOf(',');
-  int comma2 = comma1 < 0 ? -1 : cmd.indexOf(',', comma1 + 1);
-  if (comma1 < 0 || comma2 < 0 || cmd.indexOf(',', comma2 + 1) >= 0 ||
-      cmd.substring(0, comma1) != "HW_TEMP_V2") {
-    hwReply("ERR", "TEMP_V2", "reason=bad_frame");
-    return;
-  }
-  String channelValue = cmd.substring(comma1 + 1, comma2);
-  String rawValue = cmd.substring(comma2 + 1);
-  int channel = -1;
-  uint32_t raw = 0;
-  if (!hwChannel(channelValue, num_vials, &channel) ||
-      !tempParseUint(rawValue, &raw) ||
-      raw < TEMP_RAW_SETPOINT_MIN || raw > TEMP_RAW_SETPOINT_MAX) {
-    hwReply("ERR", "TEMP_V2", "reason=" + String(TEMP_ERR_MALFORMED));
-    return;
-  }
-  tempSetpoint[channel] = (double)raw;
-  tempOutput[channel] = 0;
-  temperatureControlEnabled[channel] = true;
-  allTempPIDS[channel]->SetOutputLimits(0, TEMP_PID_OUTPUT_MAX);
-  allTempPIDS[channel]->SetMode(AUTOMATIC);
-  temperatureBridgeEnabled = true;
-  normalControllerSuspended = true;
-  temperatureLastCommand = millis();
-  hwReply("OK", "TEMP_V2", "channel=" + String(channel) +
-      ",raw=" + String(raw) + ",ceiling=" + String(TEMP_PID_OUTPUT_MAX));
+  hwReply("ERR", "TEMP_V2", "reason=disabled_use_TEMP_PIPE_V2");
 }
 
 bool tempParseUint(const String &value, uint32_t *number) {
