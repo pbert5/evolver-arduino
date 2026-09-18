@@ -80,6 +80,9 @@ const uint8_t TEMP_PROTO_VER = 2;
 const uint32_t TEMP_RAW_SETPOINT_MAX = 65535UL;
 const int TEMP_PID_OUTPUT_MAX = 64;
 const char *TEMP_ERR_REPLAY = "TEMP_ERR_REPLAY";
+const char *TEMP_ERR_AUTHORITY = "TEMP_ERR_AUTHORITY";
+const char *TEMP_ERR_MALFORMED = "TEMP_ERR_MALFORMED";
+const char *TEMP_ERR_ARBITRATION = "TEMP_ERR_ARBITRATION";
 const unsigned long HW_MAX_PUMP_MS = 1000;
 const unsigned long HW_MAX_STIR_MS = 1000;
 const unsigned long HW_MAX_HEATER_MS = 250;
@@ -93,6 +96,9 @@ uint32_t tempLastCorrelation = 0;
 bool tempCorrelationSeen = false;
 bool temperatureBridgeEnabled = false;
 unsigned long temperatureLastCommand = 0;
+bool tempLeaseActive = false;
+uint32_t tempLease = 0;
+uint32_t tempGeneration = 0;
 
 struct HardwarePulse {
   bool active;
@@ -242,7 +248,7 @@ void loop() {
   if (temperatureBridgeEnabled && millis() - temperatureLastCommand > TEMP_DEADMAN_MS) {
     setHardwareSafeState();
   }
-  if (!hardwareTestMode) {
+  if (!hardwareTestMode && (temperatureBridgeEnabled || !normalControllerSuspended)) {
     readTempSensors();
     updateTemperatureControl();
   }
@@ -285,7 +291,8 @@ void loop() {
 
     // A normal experiment command explicitly returns control to the normal
     // controller.  It never resumes a pending commissioning pulse.
-    if (hardwareTestMode || normalControllerSuspended) exitHardwareTestMode();
+    if (hardwareTestMode || (normalControllerSuspended && !temperatureBridgeEnabled))
+      exitHardwareTestMode();
 
     pd.analyzeAndCheck(input_string);
     led.analyzeAndCheck(input_string);
@@ -380,6 +387,7 @@ void setHardwareSafeState() {
   }
   temperatureBridgeEnabled = false;
   temperatureLastCommand = 0;
+  tempLeaseActive = false;
 }
 
 void enterHardwareTestMode() {
@@ -472,6 +480,18 @@ bool tempParseUint(const String &value, uint32_t *number) {
   return true;
 }
 
+bool tempOwnerMatches(const String &owner) {
+  DeviceIdentity identity;
+  mev_load_identity(&identity);
+  return mev_identity_valid(&identity) && identity.owner_id[0] &&
+      owner == String(identity.owner_id);
+}
+
+bool tempAuthorityField(const String &value) {
+  return value.length() > 0 && value.length() <= 31 &&
+      value.indexOf('|') < 0 && value.indexOf('!') < 0;
+}
+
 void temperatureReply(const char *status, const String &correlation,
     const char *operation, const String &fields) {
   SerialUSB.print("TEMP|"); SerialUSB.print(TEMP_PROTO_VER); SerialUSB.print("|");
@@ -490,9 +510,9 @@ void temperatureCommandLogic() {
   }
   cmd.remove(cmd.length() - 2);
 
-  int separators[5] = {-1, -1, -1, -1, -1};
+  int separators[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
   int found = 0;
-  for (unsigned int i = 0; i < cmd.length() && found < 5; i++)
+  for (unsigned int i = 0; i < cmd.length() && found < 8; i++)
     if (cmd[i] == '|') separators[found++] = i;
   if (found < 2 || cmd.substring(0, separators[0]) != "TEMP" ||
       cmd.substring(separators[0] + 1, separators[1]) != "2") {
@@ -506,33 +526,65 @@ void temperatureCommandLogic() {
       found > 3 ? separators[3] : cmd.length()) : "";
   String channelValue = found > 3 ? cmd.substring(separators[3] + 1,
       found > 4 ? separators[4] : cmd.length()) : "";
-  String rawValue = found > 4 ? cmd.substring(separators[4] + 1) : "";
+  String rawValue = found > 4 ? cmd.substring(separators[4] + 1,
+      found > 5 ? separators[5] : cmd.length()) : "";
+  String ownerValue = found > 5 ? cmd.substring(separators[5] + 1,
+      found > 6 ? separators[6] : cmd.length()) : "";
+  String leaseValue = found > 6 ? cmd.substring(separators[6] + 1,
+      found > 7 ? separators[7] : cmd.length()) : "";
+  String generationValue = found > 7 ? cmd.substring(separators[7] + 1) : "";
+  if (operation == "SAFE") {
+    ownerValue = cmd.substring(separators[3] + 1, separators[4]);
+    leaseValue = cmd.substring(separators[4] + 1, separators[5]);
+    generationValue = cmd.substring(separators[5] + 1);
+  }
   uint32_t correlationNumber = 0;
   if (!tempParseUint(correlation, &correlationNumber) || correlationNumber == 0) {
     temperatureReply("ERR", correlation, operation.c_str(), "reason=bad_correlation");
     return;
   }
-  // SAFE is deliberately idempotent: an old or retried stop must still
-  // remove heat rather than being hidden by replay protection.
-  if (operation == "SAFE" && found == 3) {
-    if (!tempCorrelationSeen || correlationNumber > tempLastCorrelation) {
-      tempLastCorrelation = correlationNumber; tempCorrelationSeen = true;
-    }
-    setHardwareSafeState();
-    temperatureReply("ACK", correlation, "SAFE", "outputs=off");
-    return;
-  }
-  if (tempCorrelationSeen && correlationNumber <= tempLastCorrelation) {
-    temperatureReply("ERR", correlation, TEMP_ERR_REPLAY, "reason=replay");
+  uint32_t raw = 0;
+  uint32_t leaseNumber = 0;
+  uint32_t generation = 0;
+  int channel = -1;
+  bool hasChannel = operation == "SET" || operation == "DISABLE";
+  int expectedFields = operation == "SET" ? 8 : (operation == "DISABLE" ? 7 : 6);
+  if ((operation != "SET" && operation != "DISABLE" && operation != "SAFE") ||
+      found != expectedFields ||
+      (hasChannel && !hwChannel(channelValue, num_vials, &channel)) ||
+      (operation == "SET" && (!tempParseUint(rawValue, &raw) || raw > TEMP_RAW_SETPOINT_MAX)) ||
+      !tempAuthorityField(ownerValue) || !tempParseUint(leaseValue, &leaseNumber) ||
+      !tempParseUint(generationValue, &generation) || leaseNumber == 0 || generation == 0 ||
+      !tempOwnerMatches(ownerValue)) {
+    temperatureReply("ERR", correlation, operation.c_str(), "reason=" + String(TEMP_ERR_MALFORMED));
     return;
   }
 
-  uint32_t raw = 0;
-  int channel = -1;
-  if (!hwChannel(channelValue, num_vials, &channel) ||
-      (operation == "SET" && (!tempParseUint(rawValue, &raw) || raw > TEMP_RAW_SETPOINT_MAX)) ||
-      ((operation != "SET" && operation != "DISABLE") || found != 4 + (operation == "SET"))) {
-    temperatureReply("ERR", correlation, operation.c_str(), "reason=invalid_arguments");
+  if (tempCorrelationSeen && correlationNumber <= tempLastCorrelation && operation != "SAFE") {
+    temperatureReply("ERR", correlation, TEMP_ERR_REPLAY, "reason=replay");
+    return;
+  }
+  if (tempLeaseActive && (leaseNumber != tempLease || generation != tempGeneration)) {
+    temperatureReply("ERR", correlation, TEMP_ERR_AUTHORITY, "reason=lease_or_generation");
+    return;
+  }
+  if (!tempLeaseActive && operation != "SAFE" && generation <= tempGeneration) {
+    temperatureReply("ERR", correlation, TEMP_ERR_AUTHORITY, "reason=stale_generation");
+    return;
+  }
+  if (!tempLeaseActive) {
+    tempLease = leaseNumber;
+    tempGeneration = generation;
+    tempLeaseActive = true;
+  }
+  // SAFE remains idempotent after replay while still requiring authority.
+  if (operation == "SAFE") {
+    if (!tempCorrelationSeen || correlationNumber > tempLastCorrelation)
+      tempLastCorrelation = correlationNumber;
+    tempCorrelationSeen = true;
+    setHardwareSafeState();
+    tempLeaseActive = false;
+    temperatureReply("ACK", correlation, "SAFE", "outputs=off");
     return;
   }
 
@@ -547,6 +599,10 @@ void temperatureCommandLogic() {
     temperatureBridgeEnabled = false;
     for (int i = 0; i < num_vials; i++)
       temperatureBridgeEnabled = temperatureBridgeEnabled || temperatureControlEnabled[i];
+    if (!temperatureBridgeEnabled) {
+      tempLeaseActive = false;
+      normalControllerSuspended = false;
+    }
     temperatureReply("ACK", correlation, "DISABLE", "channel=" + String(channel));
     return;
   }
@@ -557,6 +613,7 @@ void temperatureCommandLogic() {
   allTempPIDS[channel]->SetOutputLimits(0, TEMP_PID_OUTPUT_MAX);
   allTempPIDS[channel]->SetMode(AUTOMATIC);
   temperatureBridgeEnabled = true;
+  normalControllerSuspended = true;
   temperatureReply("ACK", correlation, "SET", "channel=" + String(channel) +
       ",raw=" + String(raw) + ",ceiling=" + String(TEMP_PID_OUTPUT_MAX));
 }
@@ -630,6 +687,7 @@ void readTempSensors() {
 }
 
 void updateTemperatureControl() {
+  if (normalControllerSuspended && !temperatureBridgeEnabled) return;
   for (int i = 0; i < num_vials; i++) {
     if (!temperatureControlEnabled[i]) {
       tempOutput[i] = 0;
@@ -703,6 +761,12 @@ void tempLogic() {
   
   }
   if (temp.input_array[0] == "a" && temp_new_input) {
+    if (temperatureBridgeEnabled) {
+      temp_new_input = false;
+      temp.addressFound = false;
+      SerialUSB.println("TEMP|2|ERR|0|LEGACY|reason=TEMP_ERR_ARBITRATION");
+      return;
+    }
     for (int i = 0; i < num_vials; i++) {
       tempSetpoint[i] = (double)temp_saved_inputs[i];
       tempOutput[i] = 0;
