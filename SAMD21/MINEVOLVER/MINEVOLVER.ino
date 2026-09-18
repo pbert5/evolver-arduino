@@ -77,6 +77,7 @@ byte ipp = 0;
 const unsigned long HW_IDLE_TIMEOUT_MS = 15000;
 const unsigned long TEMP_DEADMAN_MS = 15000;
 const uint8_t TEMP_PROTO_VER = 2;
+const uint32_t TEMP_RAW_SETPOINT_MIN = 1UL;
 const uint32_t TEMP_RAW_SETPOINT_MAX = 65535UL;
 const int TEMP_PID_OUTPUT_MAX = 64;
 const char *TEMP_ERR_REPLAY = "TEMP_ERR_REPLAY";
@@ -276,6 +277,12 @@ void loop() {
       input_string = "";
       return;
     }
+    if (input_string.startsWith("HW_TEMP_V2,")) {
+      hardwareTemperatureCommandLogic();
+      string_complete = false;
+      input_string = "";
+      return;
+    }
     if (input_string.startsWith("HW_")) {
       hardwareCommandLogic();
       string_complete = false;
@@ -467,6 +474,47 @@ void hardwareCommandLogic() {
   hwReply("ERR", responseOperation.c_str(), "reason=invalid_command_or_arguments");
 }
 
+// Compatibility boundary for the hardware service's frozen v2 temperature
+// grammar: HW_TEMP_V2,<channel>,<raw>_!.  Ownership, lease, generation, and
+// correlation remain fenced by the service boundary; the legacy TEMP|2| path
+// below retains the firmware-native authority contract for direct callers.
+void hardwareTemperatureCommandLogic() {
+  String cmd = input_string;
+  cmd.replace("\r", ""); cmd.replace("\n", ""); cmd.trim();
+  if (!cmd.endsWith("_!")) {
+    hwReply("ERR", "TEMP_V2", "reason=bad_terminator");
+    return;
+  }
+  cmd.remove(cmd.length() - 2);
+  int comma1 = cmd.indexOf(',');
+  int comma2 = comma1 < 0 ? -1 : cmd.indexOf(',', comma1 + 1);
+  if (comma1 < 0 || comma2 < 0 || cmd.indexOf(',', comma2 + 1) >= 0 ||
+      cmd.substring(0, comma1) != "HW_TEMP_V2") {
+    hwReply("ERR", "TEMP_V2", "reason=bad_frame");
+    return;
+  }
+  String channelValue = cmd.substring(comma1 + 1, comma2);
+  String rawValue = cmd.substring(comma2 + 1);
+  int channel = -1;
+  uint32_t raw = 0;
+  if (!hwChannel(channelValue, num_vials, &channel) ||
+      !tempParseUint(rawValue, &raw) ||
+      raw < TEMP_RAW_SETPOINT_MIN || raw > TEMP_RAW_SETPOINT_MAX) {
+    hwReply("ERR", "TEMP_V2", "reason=" + String(TEMP_ERR_MALFORMED));
+    return;
+  }
+  tempSetpoint[channel] = (double)raw;
+  tempOutput[channel] = 0;
+  temperatureControlEnabled[channel] = true;
+  allTempPIDS[channel]->SetOutputLimits(0, TEMP_PID_OUTPUT_MAX);
+  allTempPIDS[channel]->SetMode(AUTOMATIC);
+  temperatureBridgeEnabled = true;
+  normalControllerSuspended = true;
+  temperatureLastCommand = millis();
+  hwReply("OK", "TEMP_V2", "channel=" + String(channel) +
+      ",raw=" + String(raw) + ",ceiling=" + String(TEMP_PID_OUTPUT_MAX));
+}
+
 bool tempParseUint(const String &value, uint32_t *number) {
   if (!value.length()) return false;
   uint32_t parsed = 0;
@@ -552,7 +600,8 @@ void temperatureCommandLogic() {
   if ((operation != "SET" && operation != "DISABLE" && operation != "SAFE") ||
       found != expectedFields ||
       (hasChannel && !hwChannel(channelValue, num_vials, &channel)) ||
-      (operation == "SET" && (!tempParseUint(rawValue, &raw) || raw > TEMP_RAW_SETPOINT_MAX)) ||
+      (operation == "SET" && (!tempParseUint(rawValue, &raw) ||
+          raw < TEMP_RAW_SETPOINT_MIN || raw > TEMP_RAW_SETPOINT_MAX)) ||
       !tempAuthorityField(ownerValue) || !tempParseUint(leaseValue, &leaseNumber) ||
       !tempParseUint(generationValue, &generation) || leaseNumber == 0 || generation == 0 ||
       !tempOwnerMatches(ownerValue)) {

@@ -7,6 +7,24 @@ SOURCE = (
 ).read_text()
 
 
+def build_hardware_temperature(channel: int, raw: int) -> str:
+    if channel not in (0, 1) or not 1 <= raw <= 65535:
+        raise ValueError("invalid temperature frame")
+    return f"HW_TEMP_V2,{channel},{raw}_!"
+
+
+def parse_hardware_temperature(frame: str) -> tuple[int, int]:
+    if not frame.endswith("_!"):
+        raise ValueError("bad terminator")
+    fields = frame[:-2].split(",")
+    if len(fields) != 3 or fields[0] != "HW_TEMP_V2":
+        raise ValueError("bad temperature frame")
+    channel, raw = (int(value) for value in fields[1:])
+    if channel not in (0, 1) or not 1 <= raw <= 65535:
+        raise ValueError("invalid temperature frame")
+    return channel, raw
+
+
 def _function(name: str) -> str:
     start = SOURCE.index(f"void {name}(")
     opening = SOURCE.index("{", start)
@@ -23,16 +41,55 @@ def _function(name: str) -> str:
 
 def test_v2_temperature_protocol_is_dispatched_before_legacy_commands():
     loop = _function("loop")
+    assert 'input_string.startsWith("HW_TEMP_V2,")' in loop
     assert 'input_string.startsWith("TEMP|2|")' in loop
+    assert "hardwareTemperatureCommandLogic();" in loop
     assert "temperatureCommandLogic();" in loop
-    assert loop.index("temperatureCommandLogic();") < loop.index("pd.analyzeAndCheck")
+    assert loop.index('input_string.startsWith("HW_TEMP_V2,")') < loop.index('input_string.startsWith("HW_")')
+    assert loop.index("hardwareTemperatureCommandLogic();") < loop.index("pd.analyzeAndCheck")
+
+
+def test_hardware_service_temperature_frame_is_exactly_comma_delimited_v2():
+    command = _function("hardwareTemperatureCommandLogic")
+    assert 'cmd.substring(0, comma1) != "HW_TEMP_V2"' in command
+    assert 'cmd.endsWith("_!")' in command
+    assert "channelValue" in command
+    assert "rawValue" in command
+    assert "cmd.indexOf(',', comma2 + 1) >= 0" in command
+    assert 'hwReply("OK", "TEMP_V2"' in command
+
+
+def test_hardware_service_temperature_frame_rejects_legacy_pipe_and_bad_raw_bounds():
+    command = _function("hardwareTemperatureCommandLogic")
+    assert 'raw < TEMP_RAW_SETPOINT_MIN' in command
+    assert 'raw > TEMP_RAW_SETPOINT_MAX' in command
+    assert "TEMP_RAW_SETPOINT_MIN = 1UL" in SOURCE
+    assert "TEMP_RAW_SETPOINT_MAX = 65535UL" in SOURCE
+    assert 'cmd.substring(0, comma1) != "HW_TEMP_V2"' in command
+
+
+def test_hardware_temperature_parser_serializer_round_trip_and_boundaries():
+    for raw in (1, 65535):
+        frame = build_hardware_temperature(1, raw)
+        assert frame == f"HW_TEMP_V2,1,{raw}_!"
+        assert parse_hardware_temperature(frame) == (1, raw)
+    for frame in ("TEMP|2|SET|1|1|1|owner|lease|generation_!",
+                  "HW_TEMP_V2,1,0_!", "HW_TEMP_V2,1,65536_!"):
+        try:
+            parse_hardware_temperature(frame)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"accepted incompatible frame: {frame}")
 
 
 def test_temperature_bridge_uses_fixed_bounds_and_native_pid_ceiling():
     assert "TEMP_PROTO_VER = 2" in SOURCE
+    assert "TEMP_RAW_SETPOINT_MIN = 1UL" in SOURCE
     assert "TEMP_PID_OUTPUT_MAX = 64" in SOURCE
     assert "TEMP_RAW_SETPOINT_MAX = 65535UL" in SOURCE
     command = _function("temperatureCommandLogic")
+    assert "TEMP_RAW_SETPOINT_MIN" in command
     assert "TEMP_RAW_SETPOINT_MAX" in command
     assert "TEMP_PID_OUTPUT_MAX" in command
     assert "SetOutputLimits(0, TEMP_PID_OUTPUT_MAX)" in SOURCE
