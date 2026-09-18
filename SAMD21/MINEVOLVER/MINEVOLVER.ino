@@ -75,6 +75,15 @@ byte ipp = 0;
 // Commissioning/debug protocol.  It is deliberately separate from evolver_si
 // commands: only complete HW_*_! messages reach this code.
 const unsigned long HW_IDLE_TIMEOUT_MS = 15000;
+const unsigned long TEMP_DEADMAN_MS = 15000;
+const uint8_t TEMP_PROTO_VER = 2;
+const uint32_t TEMP_RAW_SETPOINT_MIN = 1UL;
+const uint32_t TEMP_RAW_SETPOINT_MAX = 65535UL;
+const int TEMP_PID_OUTPUT_MAX = 64;
+const char *TEMP_ERR_REPLAY = "TEMP_ERR_REPLAY";
+const char *TEMP_ERR_AUTHORITY = "TEMP_ERR_AUTHORITY";
+const char *TEMP_ERR_MALFORMED = "TEMP_ERR_MALFORMED";
+const char *TEMP_ERR_ARBITRATION = "TEMP_ERR_ARBITRATION";
 const unsigned long HW_MAX_PUMP_MS = 1000;
 const unsigned long HW_MAX_STIR_MS = 1000;
 const unsigned long HW_MAX_HEATER_MS = 250;
@@ -84,6 +93,13 @@ const int HW_MAX_HEATER_LEVEL = 64;
 bool hardwareTestMode = false;
 bool normalControllerSuspended = false;
 unsigned long hardwareLastCommand = 0;
+uint32_t tempLastCorrelation = 0;
+bool tempCorrelationSeen = false;
+bool temperatureBridgeEnabled = false;
+unsigned long temperatureLastCommand = 0;
+bool tempLeaseActive = false;
+uint32_t tempLease = 0;
+uint32_t tempGeneration = 0;
 
 struct HardwarePulse {
   bool active;
@@ -217,7 +233,7 @@ void setup() {
     pumps[i].init(i);
   }
   for (int i = 0; i < num_vials; i++) {
-    allTempPIDS[i]->SetOutputLimits(0,255);
+    allTempPIDS[i]->SetOutputLimits(0, TEMP_PID_OUTPUT_MAX);
     allTempPIDS[i]->SetMode(MANUAL);
   }
 
@@ -230,7 +246,10 @@ void setup() {
 }
 
 void loop() {
-  if (!hardwareTestMode) {
+  if (temperatureBridgeEnabled && millis() - temperatureLastCommand > TEMP_DEADMAN_MS) {
+    setHardwareSafeState();
+  }
+  if (!hardwareTestMode && (temperatureBridgeEnabled || !normalControllerSuspended)) {
     readTempSensors();
     updateTemperatureControl();
   }
@@ -258,8 +277,20 @@ void loop() {
       input_string = "";
       return;
     }
+    if (input_string.startsWith("HW_TEMP_V2,")) {
+      hardwareTemperatureCommandLogic();
+      string_complete = false;
+      input_string = "";
+      return;
+    }
     if (input_string.startsWith("HW_")) {
       hardwareCommandLogic();
+      string_complete = false;
+      input_string = "";
+      return;
+    }
+    if (input_string.startsWith("TEMP|2|")) {
+      temperatureCommandLogic();
       string_complete = false;
       input_string = "";
       return;
@@ -267,7 +298,8 @@ void loop() {
 
     // A normal experiment command explicitly returns control to the normal
     // controller.  It never resumes a pending commissioning pulse.
-    if (hardwareTestMode || normalControllerSuspended) exitHardwareTestMode();
+    if (hardwareTestMode || (normalControllerSuspended && !temperatureBridgeEnabled))
+      exitHardwareTestMode();
 
     pd.analyzeAndCheck(input_string);
     led.analyzeAndCheck(input_string);
@@ -360,6 +392,9 @@ void setHardwareSafeState() {
     temperatureControlEnabled[i] = false;
     allTempPIDS[i]->SetMode(MANUAL);
   }
+  temperatureBridgeEnabled = false;
+  temperatureLastCommand = 0;
+  tempLeaseActive = false;
 }
 
 void enterHardwareTestMode() {
@@ -439,6 +474,165 @@ void hardwareCommandLogic() {
   hwReply("ERR", responseOperation.c_str(), "reason=invalid_command_or_arguments");
 }
 
+// The hardware service now emits the fenced TEMP|2 protocol.  Keep the old
+// HW_TEMP_V2 grammar fail-closed for upgrades, but never mutate temperature
+// state from it: TEMP|2 is the sole integrated temperature mutation path.
+void hardwareTemperatureCommandLogic() {
+  hwReply("ERR", "TEMP_V2", "reason=disabled_use_TEMP_PIPE_V2");
+}
+
+bool tempParseUint(const String &value, uint32_t *number) {
+  if (!value.length()) return false;
+  uint32_t parsed = 0;
+  for (unsigned int i = 0; i < value.length(); i++) {
+    if (!isDigit(value[i])) return false;
+    uint8_t digit = value[i] - '0';
+    if (parsed > (0xFFFFFFFFUL - digit) / 10UL) return false;
+    parsed = parsed * 10UL + digit;
+  }
+  *number = parsed;
+  return true;
+}
+
+bool tempOwnerMatches(const String &owner) {
+  DeviceIdentity identity;
+  mev_load_identity(&identity);
+  return mev_identity_valid(&identity) && identity.owner_id[0] &&
+      owner == String(identity.owner_id);
+}
+
+bool tempAuthorityField(const String &value) {
+  return value.length() > 0 && value.length() <= 31 &&
+      value.indexOf('|') < 0 && value.indexOf('!') < 0;
+}
+
+void temperatureReply(const char *status, const String &correlation,
+    const char *operation, const String &fields) {
+  SerialUSB.print("TEMP|"); SerialUSB.print(TEMP_PROTO_VER); SerialUSB.print("|");
+  SerialUSB.print(status); SerialUSB.print("|"); SerialUSB.print(correlation);
+  SerialUSB.print("|"); SerialUSB.print(operation);
+  if (fields.length()) { SerialUSB.print("|"); SerialUSB.print(fields); }
+  SerialUSB.println();
+}
+
+void temperatureCommandLogic() {
+  String cmd = input_string;
+  cmd.replace("\r", ""); cmd.replace("\n", ""); cmd.trim();
+  if (!cmd.endsWith("_!")) {
+    temperatureReply("ERR", "0", "UNKNOWN", "reason=bad_terminator");
+    return;
+  }
+  cmd.remove(cmd.length() - 2);
+
+  int separators[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
+  int found = 0;
+  for (unsigned int i = 0; i < cmd.length() && found < 8; i++)
+    if (cmd[i] == '|') separators[found++] = i;
+  if (found < 2 || cmd.substring(0, separators[0]) != "TEMP" ||
+      cmd.substring(separators[0] + 1, separators[1]) != "2") {
+    temperatureReply("ERR", "0", "UNKNOWN", "reason=bad_frame");
+    return;
+  }
+
+  String operation = cmd.substring(separators[1] + 1,
+      found > 2 ? separators[2] : cmd.length());
+  String correlation = found > 2 ? cmd.substring(separators[2] + 1,
+      found > 3 ? separators[3] : cmd.length()) : "";
+  String channelValue = found > 3 ? cmd.substring(separators[3] + 1,
+      found > 4 ? separators[4] : cmd.length()) : "";
+  String rawValue = found > 4 ? cmd.substring(separators[4] + 1,
+      found > 5 ? separators[5] : cmd.length()) : "";
+  String ownerValue = found > 5 ? cmd.substring(separators[5] + 1,
+      found > 6 ? separators[6] : cmd.length()) : "";
+  String leaseValue = found > 6 ? cmd.substring(separators[6] + 1,
+      found > 7 ? separators[7] : cmd.length()) : "";
+  String generationValue = found > 7 ? cmd.substring(separators[7] + 1) : "";
+  if (operation == "SAFE") {
+    ownerValue = cmd.substring(separators[3] + 1, separators[4]);
+    leaseValue = cmd.substring(separators[4] + 1, separators[5]);
+    generationValue = cmd.substring(separators[5] + 1);
+  }
+  uint32_t correlationNumber = 0;
+  if (!tempParseUint(correlation, &correlationNumber) || correlationNumber == 0) {
+    temperatureReply("ERR", correlation, operation.c_str(), "reason=bad_correlation");
+    return;
+  }
+  uint32_t raw = 0;
+  uint32_t leaseNumber = 0;
+  uint32_t generation = 0;
+  int channel = -1;
+  bool hasChannel = operation == "SET" || operation == "DISABLE";
+  int expectedFields = operation == "SET" ? 8 : (operation == "DISABLE" ? 7 : 6);
+  if ((operation != "SET" && operation != "DISABLE" && operation != "SAFE") ||
+      found != expectedFields ||
+      (hasChannel && !hwChannel(channelValue, num_vials, &channel)) ||
+      (operation == "SET" && (!tempParseUint(rawValue, &raw) ||
+          raw < TEMP_RAW_SETPOINT_MIN || raw > TEMP_RAW_SETPOINT_MAX)) ||
+      !tempAuthorityField(ownerValue) || !tempParseUint(leaseValue, &leaseNumber) ||
+      !tempParseUint(generationValue, &generation) || leaseNumber == 0 || generation == 0 ||
+      !tempOwnerMatches(ownerValue)) {
+    temperatureReply("ERR", correlation, operation.c_str(), "reason=" + String(TEMP_ERR_MALFORMED));
+    return;
+  }
+
+  if (tempCorrelationSeen && correlationNumber <= tempLastCorrelation && operation != "SAFE") {
+    temperatureReply("ERR", correlation, TEMP_ERR_REPLAY, "reason=replay");
+    return;
+  }
+  if (tempLeaseActive && (leaseNumber != tempLease || generation != tempGeneration)) {
+    temperatureReply("ERR", correlation, TEMP_ERR_AUTHORITY, "reason=lease_or_generation");
+    return;
+  }
+  if (!tempLeaseActive && operation != "SAFE" && generation <= tempGeneration) {
+    temperatureReply("ERR", correlation, TEMP_ERR_AUTHORITY, "reason=stale_generation");
+    return;
+  }
+  if (!tempLeaseActive) {
+    tempLease = leaseNumber;
+    tempGeneration = generation;
+    tempLeaseActive = true;
+  }
+  // SAFE remains idempotent after replay while still requiring authority.
+  if (operation == "SAFE") {
+    if (!tempCorrelationSeen || correlationNumber > tempLastCorrelation)
+      tempLastCorrelation = correlationNumber;
+    tempCorrelationSeen = true;
+    setHardwareSafeState();
+    tempLeaseActive = false;
+    temperatureReply("ACK", correlation, "SAFE", "outputs=off");
+    return;
+  }
+
+  tempLastCorrelation = correlationNumber; tempCorrelationSeen = true;
+  temperatureLastCommand = millis();
+  if (operation == "DISABLE") {
+    temperatureControlEnabled[channel] = false;
+    tempSetpoint[channel] = 0;
+    tempOutput[channel] = 0;
+    allTempPIDS[channel]->SetMode(MANUAL);
+    analogWrite(tempOutputPin[channel], 0);
+    temperatureBridgeEnabled = false;
+    for (int i = 0; i < num_vials; i++)
+      temperatureBridgeEnabled = temperatureBridgeEnabled || temperatureControlEnabled[i];
+    if (!temperatureBridgeEnabled) {
+      tempLeaseActive = false;
+      normalControllerSuspended = false;
+    }
+    temperatureReply("ACK", correlation, "DISABLE", "channel=" + String(channel));
+    return;
+  }
+
+  tempSetpoint[channel] = (double)raw;
+  tempOutput[channel] = 0;
+  temperatureControlEnabled[channel] = true;
+  allTempPIDS[channel]->SetOutputLimits(0, TEMP_PID_OUTPUT_MAX);
+  allTempPIDS[channel]->SetMode(AUTOMATIC);
+  temperatureBridgeEnabled = true;
+  normalControllerSuspended = true;
+  temperatureReply("ACK", correlation, "SET", "channel=" + String(channel) +
+      ",raw=" + String(raw) + ",ceiling=" + String(TEMP_PID_OUTPUT_MAX));
+}
+
 void serialEvent() {
   while (SerialUSB.available()) {
     char inChar = (char)SerialUSB.read();
@@ -508,6 +702,7 @@ void readTempSensors() {
 }
 
 void updateTemperatureControl() {
+  if (normalControllerSuspended && !temperatureBridgeEnabled) return;
   for (int i = 0; i < num_vials; i++) {
     if (!temperatureControlEnabled[i]) {
       tempOutput[i] = 0;
@@ -581,6 +776,12 @@ void tempLogic() {
   
   }
   if (temp.input_array[0] == "a" && temp_new_input) {
+    if (temperatureBridgeEnabled) {
+      temp_new_input = false;
+      temp.addressFound = false;
+      SerialUSB.println("TEMP|2|ERR|0|LEGACY|reason=TEMP_ERR_ARBITRATION");
+      return;
+    }
     for (int i = 0; i < num_vials; i++) {
       tempSetpoint[i] = (double)temp_saved_inputs[i];
       tempOutput[i] = 0;
